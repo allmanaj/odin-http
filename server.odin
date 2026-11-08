@@ -39,6 +39,9 @@ Server_Opts :: struct {
 	limit_headers:           int,
 	// The thread count to use, defaults to your core count - 1.
 	thread_count:            int,
+	// How long to wait for connections to drain during shutdown before forcing the
+	// process to exit. Defaults to 5 seconds.
+	shutdown_timeout:        time.Duration,
 
 	// // The initial size of the temp_allocator for each connection, defaults to 256KiB and doubles
 	// // each time it needs to grow.
@@ -55,6 +58,7 @@ Default_Server_Opts := Server_Opts {
 	redirect_head_to_get    = true,
 	limit_request_line      = 8000,
 	limit_headers           = 8000,
+	shutdown_timeout        = 5 * time.Second,
 	// initial_temp_block_cap  = 256 * mem.Kilobyte,
 	// max_free_blocks_queued  = 64,
 }
@@ -90,6 +94,10 @@ Server :: struct {
 	// Updated every second with an updated date, this speeds up the server considerably
 	// because it would otherwise need to call time.now() and format the date on each response.
 	date:           Server_Date,
+
+	shutdown_timeout: time.Duration,
+	// Set once the server has fully cleaned up, so the shutdown watchdog can stop.
+	closed:           Atomic(bool),
 }
 
 Server_Thread :: struct {
@@ -122,6 +130,10 @@ listen :: proc(
 	opts: Server_Opts = Default_Server_Opts,
 ) -> (err: net.Network_Error) {
 	s.opts = opts
+	s.shutdown_timeout = opts.shutdown_timeout
+	if s.shutdown_timeout <= 0 {
+		s.shutdown_timeout = Default_Server_Opts.shutdown_timeout
+	}
 	s.conn_allocator = context.allocator
 	// initial_block_cap = int(s.opts.initial_temp_block_cap)
 	// max_free_blocks_queued = int(s.opts.max_free_blocks_queued)
@@ -142,6 +154,10 @@ listen :: proc(
 serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	if atomic_load(&s.closing) { return }
 	s.handler = h
+	atomic_store(&s.closed, false)
+	if s.shutdown_timeout <= 0 {
+		s.shutdown_timeout = Default_Server_Opts.shutdown_timeout
+	}
 
 	if s.opts.thread_count == 0 {
 		s.opts.thread_count = os.get_processor_core_count()
@@ -153,6 +169,10 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	for &td in s.threads[1:] {
 		td.thread = thread.create_and_start_with_poly_data2(s, &td, _server_thread_init, context)
 	}
+
+	// Guards against a stuck handler or event loop keeping the process (and the
+	// listener socket) alive forever.
+	thread.create_and_start_with_poly_data(s, _shutdown_watchdog, context, self_cleanup = true)
 
 	// Start keeping track of and caching the date for the required date header.
 	server_date_start(s)
@@ -167,6 +187,7 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	net.close(s.tcp_sock)
 	for t in s.threads[1:] { thread.destroy(t.thread) }
 	delete(s.threads)
+	atomic_store(&s.closed, true)
 
 	return nil
 }
@@ -226,6 +247,34 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 @(private)
 SHUTDOWN_INTERVAL :: time.Millisecond * 100
 
+// How often the shutdown watchdog checks whether the deadline has passed.
+@(private)
+SHUTDOWN_WATCHDOG_POLL :: time.Millisecond * 25
+
+// Exits the process if shutdown does not finish within `s.shutdown_timeout`.
+// The listener socket is closed by the OS on exit, so the port is always freed.
+@(private)
+_shutdown_watchdog :: proc(s: ^Server) {
+	for !atomic_load(&s.closed) {
+		if atomic_load(&s.closing) {
+			timeout := s.shutdown_timeout
+			if timeout <= 0 {
+				timeout = Default_Server_Opts.shutdown_timeout
+			}
+			deadline := time.time_add(time.now(), timeout)
+			for !atomic_load(&s.closed) {
+				if time.since(deadline) >= 0 {
+					log.errorf("shutdown did not finish within %v, forcing exit", timeout)
+					os.exit(1)
+				}
+				time.sleep(SHUTDOWN_WATCHDOG_POLL)
+			}
+			return
+		}
+		time.sleep(SHUTDOWN_WATCHDOG_POLL)
+	}
+}
+
 // Starts a graceful shutdown.
 //
 // Some error logs will be generated but all active connections are finished
@@ -248,6 +297,14 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 
 	td.state = .Closing
 	defer delete(td.conns)
+
+	// Stop accepting new connections before draining, so a new client cannot
+	// extend shutdown or arrive after the listener is supposed to be closing.
+	if td.accept != nil {
+		nbio.remove(td.accept)
+		td.accept = nil
+	}
+
 	// defer {
 	// 	blocks: int
 	// 	for _, &bucket in td.free_temp_blocks {
@@ -266,7 +323,7 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 			#partial switch conn.state {
 			case .Active:
 				log.infof("shutdown: connection %i still active", sock)
-			case .New, .Idle, .Pending:
+			case .New, .Idle, .Pending, .Will_Close:
 				log.infof("shutdown: closing connection %i", sock)
 				connection_close(conn)
 			case .Closing:
@@ -280,8 +337,10 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 			break
 		}
 
-		err := nbio.tick()
-		fmt.assertf(err == nil, "IO tick error during shutdown: %v")
+		// Bounded tick: never block forever waiting for an event that may never
+		// arrive after the last connection completion was processed.
+		err := nbio.tick(SHUTDOWN_INTERVAL)
+		fmt.assertf(err == nil, "IO tick error during shutdown: %v", err)
 	}
 
 	td.state = .Cleaning
@@ -289,7 +348,14 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 	nbio.remove(td.accept)
 	td.accept = nil
 
-	nbio.run()
+	// Bounded drain: pending removals and close completions still need ticks to
+	// finish, but waiting with an infinite timeout can block forever.
+	drain_deadline := time.time_add(time.now(), SHUTDOWN_INTERVAL)
+	for nbio.num_waiting() > 0 && time.since(drain_deadline) < 0 {
+		err := nbio.tick(SHUTDOWN_INTERVAL)
+		fmt.assertf(err == nil, "IO tick error during shutdown: %v", err)
+	}
+
 	nbio.release_thread_event_loop()
 
 	td.state = .Closed
@@ -313,8 +379,8 @@ server_shutdown_on_interrupt :: proc(s: ^Server) {
 		proc "cdecl" (_: i32) {
 			context = on_interrupt_context
 
-			// Force close on second signal.
-			if td.state == .Closing {
+			// Force close on any signal after shutdown has started.
+			if on_interrupt_server != nil && atomic_load(&on_interrupt_server.closing) {
 				os.exit(1)
 			}
 
@@ -420,6 +486,7 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 		case .Insufficient_Resources:
 			log.error("Connection limit reached, trying again in a bit")
 			nbio.timeout_poly(time.Second, server, proc(_: ^nbio.Operation, server: ^Server) {
+				if atomic_load(&server.closing) { return }
 				td.accept = nbio.accept_poly(server.tcp_sock, server, on_accept)
 			})
 			return
